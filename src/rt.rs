@@ -2,119 +2,27 @@ use core::{
     future::Future,
     task::{Context, Waker, RawWaker, RawWakerVTable},
     ptr,
-    marker::PhantomData,
     hash::Hash,
     fmt,
 };
 use std::{
-    sync::{Arc, Weak},
+    sync::{Arc, Weak, Mutex},
     collections::HashMap,
     io,
-    sync::Mutex,
 };
 use futures::future::BoxFuture;
 use crossbeam::deque::{Injector, Steal};
 use mio::{Poll, Token, event::Source, Events, Interest};
 
+pub trait Config {
+    type TaskId: Eq + Hash + Clone + fmt::Display;
+}
+
 impl<T> Config for T
 where
-    T: Eq + Hash + fmt::Display,
+    T: Eq + Hash + Clone + fmt::Display,
 {
     type TaskId = T;
-}
-
-pub trait Config {
-    type TaskId: Eq + Hash + fmt::Display;
-}
-
-pub struct Executor<C>
-where
-    C: Config,
-{
-    spawner: Arc<SpawnerInner<C>>,
-    registry: Arc<Mutex<RegistryInner>>,
-}
-
-#[derive(Clone)]
-pub struct Registry {
-    inner: Weak<Mutex<RegistryInner>>,
-}
-
-struct RegistryInner {
-    poll: Poll,
-    last_token: Option<Token>,
-}
-
-impl RegistryInner {
-    fn new() -> Result<Self, io::Error> {
-        Ok(RegistryInner {
-            poll: Poll::new()?,
-            last_token: None,
-        })
-    }
-
-    fn last(&self) -> Option<Token> {
-        self.last_token.clone()
-    }
-}
-
-impl Registry {
-    fn inner<F, T>(&self, f: F) -> T
-    where
-        F: FnOnce(&mut RegistryInner) -> T,
-    {
-        let s = self.inner.upgrade().unwrap();
-        let mut s = s.lock().unwrap();
-        f(&mut s)
-    }
-
-    pub fn register<S>(
-        &self,
-        source: &mut S,
-        token: usize,
-        interests: Interest,
-    ) -> Result<(), io::Error>
-    where
-        S: Source + ?Sized + fmt::Debug,
-    {
-        log::debug!("register {:?} {:?} {:?}", source, token, interests);
-
-        self.inner(|s| {
-            s.last_token = Some(Token(token));
-            s.poll.registry().register(source, Token(token), interests)
-        })
-    }
-
-    pub fn reregister<S>(
-        &self,
-        source: &mut S,
-        token: usize,
-        interests: Interest,
-    ) -> Result<(), io::Error>
-    where
-        S: Source + ?Sized + fmt::Debug,
-    {
-        log::debug!("reregister {:?} {:?} {:?}", source, token, interests);
-
-        self.inner(|s| {
-            s.last_token = Some(Token(token));
-            s.poll
-                .registry()
-                .reregister(source, Token(token), interests)
-        })
-    }
-
-    pub fn deregister<S>(&self, source: &mut S) -> Result<(), io::Error>
-    where
-        S: Source + ?Sized + fmt::Debug,
-    {
-        log::debug!("deregister {:?}", source);
-
-        self.inner(|s| {
-            s.last_token = None;
-            s.poll.registry().deregister(source)
-        })
-    }
 }
 
 pub struct Task<C>
@@ -125,85 +33,116 @@ where
     future: BoxFuture<'static, ()>,
 }
 
-impl<C> fmt::Display for Task<C>
+enum WaitReason {
+    Io(Token),
+    // TODO:
+    //Timer,
+    //Signal,
+    //OtherThread,
+    //OtherTask,
+}
+
+pub enum Reg {
+    Reg(Token, Interest),
+    ReReg(Token, Interest),
+    DeReg,
+}
+
+struct TaskContext {
+    wait_reason: Option<WaitReason>,
+}
+
+pub struct Executor<C>
 where
     C: Config,
 {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "task({})", self.id)
-    }
+    strong: Arc<ExecutorInner<C>>,
 }
 
-impl<C> fmt::Debug for Task<C>
-where
-    C: Config,
-{
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_tuple("Task").field(&self.id.to_string()).finish()
-    }
-}
-
-pub struct Spawner<C>
-where
-    C: Config,
-{
-    inner: Weak<SpawnerInner<C>>,
-    registry: Weak<Mutex<RegistryInner>>,
-}
-
-struct SpawnerInner<C>
+struct ExecutorInner<C>
 where
     C: Config,
 {
     injector: Injector<Task<C>>,
-    phantom_data: PhantomData<C>,
+    poll: Mutex<Poll>,
+    task_contexts: Mutex<HashMap<C::TaskId, TaskContext>>,
 }
 
-impl<C> SpawnerInner<C>
+pub struct ExecutorRef<C>
 where
     C: Config,
 {
-    fn new() -> Self {
-        SpawnerInner {
-            injector: Injector::new(),
-            phantom_data: PhantomData,
-        }
-    }
+    weak: Weak<ExecutorInner<C>>,
+    this: C::TaskId,
 }
 
-impl<C> Clone for Spawner<C>
+impl<C> Clone for ExecutorRef<C>
 where
     C: Config,
 {
     fn clone(&self) -> Self {
-        Spawner {
-            inner: self.inner.clone(),
-            registry: self.registry.clone(),
+        ExecutorRef {
+            weak: self.weak.clone(),
+            this: self.this.clone(),
         }
     }
 }
 
-impl<C> Spawner<C>
+impl<C> ExecutorRef<C>
 where
     C: Config,
 {
     pub fn spawn<F, Fut>(&self, id: C::TaskId, f: F)
     where
-        F: FnOnce(Spawner<C>, Registry) -> Fut,
+        F: FnOnce(ExecutorRef<C>) -> Fut,
         Fut: Future<Output = ()> + Send + 'static,
     {
-        let future = f(
-            self.clone(),
-            Registry {
-                inner: self.registry.clone(),
-            },
-        );
+        let executor_ref = ExecutorRef {
+            weak: self.weak.clone(),
+            this: id.clone(),
+        };
+        let future = f(executor_ref);
         let task = Task {
-            id,
+            id: id.clone(),
             future: Box::pin(future),
         };
-        self.inner.upgrade().unwrap().injector.push(task);
+        let s = self.weak.upgrade().unwrap();
+        s.injector.push(task);
+        let context = TaskContext {
+            wait_reason: None,
+        };
+        s.task_contexts.lock().unwrap().insert(id, context);
     }
+
+    pub fn register<S>(
+        &self,
+        source: &mut S,
+        reg: Reg,
+    ) -> Result<(), io::Error>
+    where
+        S: Source + ?Sized + fmt::Debug,
+    {
+        let s = self.weak.upgrade().unwrap();
+        let mut ctxs = s.task_contexts.lock().unwrap();
+        let mut ctx = ctxs.get_mut(&self.this).unwrap();
+        let poll = s.poll.lock().unwrap();
+        let result = match reg {
+            Reg::Reg(token, interests) => {
+                ctx.wait_reason = Some(WaitReason::Io(token));
+                poll.registry().register(source, token, interests)
+            },
+            Reg::ReReg(token, interests) => {
+                ctx.wait_reason = Some(WaitReason::Io(token));
+                poll.registry().register(source, token, interests)
+            },
+            Reg::DeReg => {
+                ctx.wait_reason = None;
+                poll.registry().deregister(source)
+            },
+        };
+        result
+    }
+
 }
 
 impl<C> Executor<C>
@@ -212,26 +151,35 @@ where
 {
     pub fn run<F, Fut>(id: C::TaskId, f: F) -> Result<(), io::Error>
     where
-        F: FnOnce(Spawner<C>, Registry) -> Fut,
+        F: FnOnce(ExecutorRef<C>) -> Fut,
         Fut: Future<Output = ()> + Send + 'static,
     {
         let rt = Self::new()?;
-        rt.spawner().spawn(id, f);
+        let executor_ref = ExecutorRef {
+            weak: Arc::downgrade(&rt.strong),
+            this: id.clone(),
+        };
+        let future = f(executor_ref);
+        let task = Task {
+            id: id.clone(),
+            future: Box::pin(future),
+        };
+        rt.strong.injector.push(task);
+        let context = TaskContext {
+            wait_reason: None,
+        };
+        rt.strong.task_contexts.lock().unwrap().insert(id, context);
         rt.run_inner()
     }
 
     fn new() -> Result<Self, io::Error> {
         Ok(Executor {
-            spawner: Arc::new(SpawnerInner::new()),
-            registry: Arc::new(Mutex::new(RegistryInner::new()?)),
+            strong: Arc::new(ExecutorInner {
+                injector: Injector::new(),
+                poll: Mutex::new(Poll::new()?),
+                task_contexts: Mutex::new(HashMap::new()),
+            }),
         })
-    }
-
-    fn spawner(&self) -> Spawner<C> {
-        Spawner {
-            inner: Arc::downgrade(&self.spawner),
-            registry: Arc::downgrade(&self.registry),
-        }
     }
 
     fn run_inner(self) -> Result<(), io::Error> {
@@ -242,20 +190,21 @@ where
         let waker = unsafe { Waker::from_raw(raw_waker) };
         let mut cx = Context::from_waker(&waker);
 
-        let reg = self.registry.as_ref();
+        let poll = &self.strong.poll;
 
         let mut waiting: HashMap<Token, Task<C>> = HashMap::new();
         let mut events = Events::with_capacity(128);
 
         loop {
             // traversal new tasks
-            while !self.spawner.injector.is_empty() {
-                if let Steal::Success(mut task) = self.spawner.injector.steal() {
-                    log::debug!("spawned new {}", task);
+            while !self.strong.injector.is_empty() {
+                if let Steal::Success(mut task) = self.strong.injector.steal() {
+                    //log::debug!("spawned new {}", task);
                     if task.future.as_mut().poll(&mut cx).is_pending() {
-                        // TODO: fix race condition
-                        if let Some(token) = reg.lock().unwrap().last() {
-                            waiting.insert(token, task);
+                        let ctxs = self.strong.task_contexts.lock().unwrap();
+                        let ctx = ctxs.get(&task.id);
+                        if let Some(TaskContext { wait_reason: Some(WaitReason::Io(t)) }) = ctx {
+                            waiting.insert(t.clone(), task);
                         }
                     }
                 }
@@ -263,8 +212,8 @@ where
 
             // wait
             if !waiting.is_empty() {
-                log::debug!("poll {:?}", waiting);
-                reg.lock().unwrap().poll.poll(&mut events, None)?;
+                //log::debug!("poll {:?}", waiting);
+                poll.lock().unwrap().poll(&mut events, None)?;
             } else {
                 break Ok(());
             }
@@ -272,11 +221,12 @@ where
             // wake
             for event in events.into_iter() {
                 if let Some(mut task) = waiting.remove(&event.token()) {
-                    log::debug!("try advance {}", task);
+                    //log::debug!("try advance {}", task);
                     if task.future.as_mut().poll(&mut cx).is_pending() {
-                        // TODO: fix race condition
-                        if let Some(token) = reg.lock().unwrap().last() {
-                            waiting.insert(token, task);
+                        let ctxs = self.strong.task_contexts.lock().unwrap();
+                        let ctx = ctxs.get(&task.id);
+                        if let Some(TaskContext { wait_reason: Some(WaitReason::Io(t)) }) = ctx {
+                            waiting.insert(t.clone(), task);
                         }
                     }
                 }

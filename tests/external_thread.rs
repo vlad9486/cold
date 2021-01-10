@@ -36,5 +36,5 @@ fn other_thread() -> io::Result<()> {
     }
 
     let s = S(Arc::new(AtomicBool::new(false)));
-    Executor::<usize>::run(0, move |_, _| async { async { s.await }.await })
+    Executor::<usize>::run(0, move |_| async { async { s.await }.await })
 }

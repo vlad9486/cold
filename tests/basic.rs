@@ -9,21 +9,21 @@ use cold::{rt::Executor, net::WithRegistry};
 
 #[test]
 fn nop() -> io::Result<()> {
-    Executor::<usize>::run(0, move |_, _| async {})
+    Executor::<usize>::run(0, move |_| async {})
 }
 
 #[test]
 fn nested() -> io::Result<()> {
-    Executor::<usize>::run(0, move |_, _| async {
+    Executor::<usize>::run(0, move |_| async {
         async { async { println!("hello world") }.await }.await
     })
 }
 
 #[test]
 fn nested_spawn() -> io::Result<()> {
-    Executor::<usize>::run(0, move |spawner, _| async move {
+    Executor::<usize>::run(0, move |executor| async move {
         println!("hello outer world");
-        spawner.spawn(1, move |_, _| async {
+        executor.spawn(1, move |_| async {
             println!("hello inner world");
         });
     })
@@ -43,17 +43,17 @@ fn tcp_server() -> io::Result<()> {
         }
     });
 
-    Executor::<usize>::run(0, move |spawner, registry| async move {
+    Executor::<usize>::run(0, move |executor| async move {
         let listener = TcpListener::bind("127.0.0.1:9000").unwrap();
         listener.set_nonblocking(true).unwrap();
-        let mut listener = WithRegistry::new(listener, &registry);
+        let mut listener = WithRegistry::new(listener, &executor);
         let mut id = 1;
         while let Some(p) = listener.next().await {
             let (stream, address) = p.unwrap();
             println!("{:?}", address);
 
-            spawner.spawn(id, move |_, registry| async move {
-                let mut stream = WithRegistry::new(stream, &registry);
+            executor.spawn(id, move |executor| async move {
+                let mut stream = WithRegistry::new(stream, &executor);
                 let mut buf = [0; 0x100];
                 let read = stream.read(&mut buf).await.unwrap();
                 println!("{}", str::from_utf8(&buf[..read]).unwrap());
